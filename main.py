@@ -21,7 +21,7 @@ def run():
 
     reports = []
     for uni_name, pages in scraped.items():
-        for page_type in ("programs", "fees"):
+        for page_type in ("programs", "fees", "notifications"):
             for url, new_content in pages.get(page_type, {}).items():
                 if url == "_error":
                     continue
