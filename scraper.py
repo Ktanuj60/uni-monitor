@@ -17,6 +17,9 @@ if present, the scraper uses those instead of discovering.
 import json
 from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright
+from noise_filter import clean_lines, is_blocked_page
+
+SCRAPE_BLOCKED_SENTINEL = "__SCRAPE_BLOCKED__"
 
 PROGRAM_KEYWORDS = [
     "program", "programme", "course", "specialization", "specialisation",
@@ -152,24 +155,42 @@ def extract_text(page):
 def normalize_text(txt):
     lines = [l.strip() for l in txt.splitlines()]
     lines = [l for l in lines if l]
-    return "\n".join(lines)
+    return clean_lines("\n".join(lines))
+
+
+def settle(page):
+    """Waits for dynamic content (JS-rendered dropdowns, lazy-loaded fee
+    tables, 'Loading...' placeholders) to finish before we read the page,
+    instead of reading it mid-render."""
+    try:
+        page.wait_for_load_state("networkidle", timeout=8000)
+    except Exception:
+        pass
+    page.wait_for_timeout(1200)
 
 
 def visit_and_extract(page, url, popup_key_prefix, results_bucket):
     """Navigates to url, captures+closes popups, captures ticker text,
-    extracts main content, and stores everything into results_bucket."""
+    extracts main content, and stores everything into results_bucket.
+    If the page turns out to be a bot-check / challenge page rather than
+    real content, stores a sentinel instead so it's never reported as a
+    'change' and never overwrites the last good snapshot."""
     try:
         page.goto(url, timeout=45000, wait_until="domcontentloaded")
-        page.wait_for_timeout(1500)
+        settle(page)
 
         popup_text = capture_and_close_popups(page)
-        if popup_text:
-            results_bucket[f"{url} [popup]"] = popup_text
+        if popup_text and not is_blocked_page(popup_text):
+            results_bucket[f"{url} [popup]"] = clean_lines(popup_text)
 
         ticker_text = extract_ticker_text(page)
         main_text = extract_text(page)
         combined = f"{ticker_text}\n\n{main_text}".strip() if ticker_text else main_text
-        results_bucket[url] = combined
+
+        if is_blocked_page(combined):
+            results_bucket[url] = SCRAPE_BLOCKED_SENTINEL
+        else:
+            results_bucket[url] = combined
     except Exception as e:
         results_bucket[url] = f"[ERROR fetching page: {e}]"
 
@@ -185,17 +206,18 @@ def scrape_university(browser, uni):
         ))
         page = context.new_page()
         page.goto(uni["url"], timeout=45000, wait_until="domcontentloaded")
-        page.wait_for_timeout(2000)
+        settle(page)
 
         # Homepage: always captured as a notifications entry too (running
         # tickers / popups / "what's new" banners most often live here).
         popup_text = capture_and_close_popups(page)
-        if popup_text:
-            result["notifications"][f"{uni['url']} [popup]"] = popup_text
+        if popup_text and not is_blocked_page(popup_text):
+            result["notifications"][f"{uni['url']} [popup]"] = clean_lines(popup_text)
         ticker_text = extract_ticker_text(page)
         homepage_main = extract_text(page)
+        homepage_combined = f"{ticker_text}\n\n{homepage_main}".strip() if ticker_text else homepage_main
         result["notifications"][uni["url"]] = (
-            f"{ticker_text}\n\n{homepage_main}".strip() if ticker_text else homepage_main
+            SCRAPE_BLOCKED_SENTINEL if is_blocked_page(homepage_combined) else homepage_combined
         )
 
         program_urls = uni.get("program_urls") or discover_links(page, uni["url"], PROGRAM_KEYWORDS)
