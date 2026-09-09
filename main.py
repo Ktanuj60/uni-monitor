@@ -1,6 +1,6 @@
 import json
 import datetime
-from scraper import scrape_all
+from scraper import scrape_all, SCRAPE_BLOCKED_SENTINEL
 from sheets_store import load_previous_snapshot, save_all_snapshots
 from diff_and_alert import build_report, format_email_html, send_email
 
@@ -27,6 +27,12 @@ def run():
             for url, new_content in pages.get(page_type, {}).items():
                 if url == "_error":
                     continue
+                if new_content == SCRAPE_BLOCKED_SENTINEL:
+                    # Hit a bot-check/challenge page instead of real content.
+                    # Don't diff it, don't overwrite the last good snapshot.
+                    print(f"  Skipped (bot-check page): {uni_name} / {page_type} / {url}")
+                    continue
+
                 key = (uni_name, page_type, url)
                 old = previous.get(key)
                 old_content = old["content"] if old else None
