@@ -21,6 +21,13 @@ NOISE_LINE_PATTERNS = [
     r"^captcha$",
     r"^verify you are human",
     r"^enable javascript",
+    r"^slide \d+( to \d+)? of \d+$",
+]
+
+NOTIFICATION_KEYWORDS = [
+    "offer", "discount", "scholarship", "announcement", "notice", "news",
+    "update", "alert", "admission open", "deadline", "last date", "event",
+    "webinar", "notification", "whats-new", "what's new"
 ]
 
 BLOCKED_PAGE_MARKERS = [
