@@ -1,31 +1,25 @@
 """
 scraper.py
 Visits each university website, captures any popup/notification-modal text
-before closing it, auto-discovers Programs, Fees, and Notifications
-(offers/discounts/scholarships/announcements/news) pages, and extracts
-STRUCTURED content -- Programs with their Specializations, Fees as clean
-item/amount pairs, and Offers/Discounts/Scholarships as a clean list --
-using free, rule-based parsing of the page's own HTML (no paid API):
+before closing it, auto-discovers Programs, Fees, and Notifications pages,
+and extracts STRUCTURED content -- Programs with Specializations, Fees as
+clean item/amount pairs, Offers/Discounts/Scholarships as a clean list --
+using free, rule-based parsing of the page's own HTML (no paid API).
 
-- Fees: every <table> row and <dl> item on the page is read as a literal
-  Label/Value pair. Most university fee breakups are already laid out in
-  tables, so this captures them structurally for free.
-- Programs/Specializations: each heading (h2/h3/h4) is treated as a
-  candidate program name, and the list items directly under it (before the
-  next heading) are treated as its specializations. Works well on sites
-  that use real heading/list markup; sites that write everything as plain
-  paragraphs won't structure as cleanly -- that content still gets
-  captured in the free-text fallback, just not as a formal Program entry.
-- Notifications: lines from the page's cleaned text that mention offer/
-  discount/scholarship/announcement keywords.
-
-Why auto-discovery instead of hardcoded page URLs:
-Every one of these 30 sites has a different structure, and pages get
-renamed/restructured over time. Auto-discovery by keyword is more
-resilient than hardcoded URLs that quietly go stale. You can always
-override a specific university's pages by adding "program_urls" /
-"fee_urls" / "notification_urls" arrays directly in universities.json --
-if present, the scraper uses those instead of discovering.
+Key correctness fixes in this version:
+- Page selection is now DETERMINISTIC (sorted, not a raw set()) -- earlier
+  versions picked a random subset of discovered pages every run because
+  Python's set() iteration order is randomized per process, which caused
+  programs to falsely look "added"/"removed" run to run even when nothing
+  changed on the site.
+- Every page is only ever scraped ONCE per run (shared cache), even if it's
+  relevant to more than one category (e.g. a program's own page often has
+  a "Fee Structure" table on it too -- very common on these sites, since
+  many don't have a separate sitewide Fees page at all).
+- Program page coverage raised well above the old cap of 4, since sites
+  can legitimately list far more programs than that.
+- Duplicate program/fee entries on a single page (e.g. carousel-cloned
+  DOM nodes for infinite-scroll effects) are merged before diffing.
 """
 
 import json
@@ -46,9 +40,6 @@ FEE_KEYWORDS = [
     "emi", "breakup", "fee structure", "structure"
 ]
 
-# Common patterns for popup/modal containers -- used both to READ their
-# text (so an offer/discount shown only in a popup still gets captured)
-# and then to close them.
 MODAL_CONTAINER_SELECTORS = [
     "[role='dialog']", ".modal", "[class*='modal' i]", "[class*='popup' i]",
     "[class*='overlay' i]", "[id*='popup' i]", "[id*='modal' i]",
@@ -59,19 +50,16 @@ POPUP_CLOSE_SELECTORS = [
     "[class*='close' i][class*='modal' i]", "[class*='close' i][class*='popup' i]",
     "svg[class*='close' i]", ".modal .close", "[data-dismiss='modal']",
 ]
-
-# Selectors for running-news tickers / marquees / notification bars that
-# often carry offers, deadlines, and announcements separately from the
-# main page body.
 TICKER_SELECTORS = [
     "marquee", ".ticker", ".marquee", ".news-ticker", ".notification-bar",
     ".running-text", ".scroll-text", "[class*='ticker' i]",
     "[class*='marquee' i]", "[class*='announcement' i]", "[class*='notice' i]",
 ]
 
-MAX_PAGES_PER_CATEGORY = 4  # cap how many discovered pages we crawl per category, per site
+MAX_PROGRAM_PAGES = 12   # sites can legitimately list many programs
+MAX_FEE_PAGES = 4        # dedicated fee-keyword nav links, if any exist
+MAX_NOTIFICATION_PAGES = 4
 
-# JS run in-page to read <table>/<dl> rows as Label/Value fee pairs.
 FEE_TABLE_JS = """
 () => {
   const pairs = [];
@@ -97,12 +85,10 @@ FEE_TABLE_JS = """
 }
 """
 
-# JS run in-page to treat headings as Program names and the list right
-# under each heading as its Specializations.
 PROGRAM_HEADING_JS = """
 () => {
   const scope = document.querySelector('main, article, [role="main"], #content, .content') || document.body;
-  const headings = Array.from(scope.querySelectorAll('h2, h3, h4'));
+  const headings = Array.from(scope.querySelectorAll('h1, h2, h3, h4'));
   const result = [];
   for (const h of headings) {
     const name = (h.innerText || '').trim();
@@ -129,12 +115,41 @@ PROGRAM_HEADING_JS = """
 """
 
 
+def dedupe_programs(programs):
+    """Collapses duplicate program entries (same name, case/whitespace
+    insensitive) that come from carousel-cloned DOM nodes or a page listing
+    the same program more than once, merging their specializations."""
+    merged, order = {}, []
+    for p in programs:
+        name = (p.get("name") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key not in merged:
+            merged[key] = {"name": name, "specializations": set()}
+            order.append(key)
+        merged[key]["specializations"].update(
+            s.strip() for s in p.get("specializations", []) if s.strip()
+        )
+    return [{"name": merged[k]["name"], "specializations": sorted(merged[k]["specializations"])}
+            for k in order]
+
+
+def dedupe_fees(fees):
+    seen, order = {}, []
+    for f in fees:
+        item = (f.get("item") or "").strip()
+        if not item:
+            continue
+        key = item.lower()
+        if key not in seen:
+            seen[key] = {"item": item, "amount": (f.get("amount") or "").strip()}
+            order.append(key)
+    return [seen[k] for k in order]
+
+
 def capture_and_close_popups(page):
-    """Reads visible text from any popup/modal BEFORE closing it (so an
-    offer/discount/scholarship shown only in a popup still gets captured),
-    then dismisses it."""
-    captured = []
-    seen = set()
+    captured, seen = [], set()
     for sel in MODAL_CONTAINER_SELECTORS:
         try:
             for el in page.query_selector_all(sel):
@@ -145,7 +160,6 @@ def capture_and_close_popups(page):
                         captured.append(t)
         except Exception:
             continue
-
     for sel in POPUP_CLOSE_SELECTORS:
         try:
             el = page.query_selector(sel)
@@ -158,14 +172,11 @@ def capture_and_close_popups(page):
         page.keyboard.press("Escape")
     except Exception:
         pass
-
     return "\n---\n".join(captured)
 
 
 def extract_ticker_text(page):
-    """Grabs text from running-news tickers/marquees/notification bars."""
-    texts = []
-    seen = set()
+    texts, seen = [], set()
     for sel in TICKER_SELECTORS:
         try:
             for el in page.query_selector_all(sel):
@@ -179,12 +190,7 @@ def extract_ticker_text(page):
 
 
 def extract_image_alts(page):
-    """Catches offers/announcements shown as banner IMAGES rather than text,
-    by reading their alt attributes (works only if the site set meaningful
-    alt text -- a pure graphic banner with no alt text can't be read this
-    way without OCR, which this free pipeline doesn't do)."""
-    texts = []
-    seen = set()
+    texts, seen = [], set()
     try:
         for img in page.query_selector_all("img[alt]"):
             alt = (img.get_attribute("alt") or "").strip()
@@ -196,7 +202,9 @@ def extract_image_alts(page):
     return "\n".join(texts)
 
 
-def discover_links(page, base_url, keywords):
+def discover_links(page, base_url, keywords, max_count):
+    """Returns a DETERMINISTIC (sorted) list, capped at max_count, so the
+    same pages get chosen every run instead of a random subset."""
     found = set()
     try:
         anchors = page.query_selector_all("a")
@@ -216,12 +224,10 @@ def discover_links(page, base_url, keywords):
             full = urljoin(base_url, href)
             if urlparse(full).netloc == base_host and full.startswith("http"):
                 found.add(full.split("#")[0])
-    return list(found)[:MAX_PAGES_PER_CATEGORY]
+    return sorted(found)[:max_count]
 
 
 def extract_text(page):
-    """Grab visible text, preferring <main>/<article> content over full body
-    (to reduce nav/footer noise), falling back to body innerText."""
     for sel in ["main", "article", "[role='main']", "#content", ".content"]:
         try:
             el = page.query_selector(sel)
@@ -244,9 +250,6 @@ def normalize_text(txt):
 
 
 def settle(page):
-    """Waits for dynamic content (JS-rendered dropdowns, lazy-loaded fee
-    tables, 'Loading...' placeholders) to finish before we read the page,
-    instead of reading it mid-render."""
     try:
         page.wait_for_load_state("networkidle", timeout=8000)
     except Exception:
@@ -255,73 +258,71 @@ def settle(page):
 
 
 def extract_notification_lines(text):
-    """Free, rule-based stand-in for AI extraction: pulls out lines that
-    actually mention an offer/discount/scholarship/announcement keyword,
-    instead of returning the whole page's text as 'notifications'."""
-    lines = []
-    seen = set()
+    lines, seen = [], set()
     for line in text.splitlines():
         s = line.strip()
         if not s or s in seen:
             continue
-        low = s.lower()
-        if any(kw in low for kw in NOTIFICATION_KEYWORDS):
+        if any(kw in s.lower() for kw in NOTIFICATION_KEYWORDS):
             seen.add(s)
             lines.append(s)
     return lines[:30]
 
 
 def extract_structured(page, combined_text):
-    """Free, rule-based structure extraction: tables/dl -> fees,
-    headings+lists -> programs/specializations, keyword lines -> notifications."""
     try:
-        fees = page.evaluate(FEE_TABLE_JS) or []
+        fees = dedupe_fees(page.evaluate(FEE_TABLE_JS) or [])
     except Exception:
         fees = []
     try:
-        programs = page.evaluate(PROGRAM_HEADING_JS) or []
+        programs = dedupe_programs(page.evaluate(PROGRAM_HEADING_JS) or [])
     except Exception:
         programs = []
     notifications = extract_notification_lines(combined_text)
     return {"programs": programs, "fees": fees, "notifications": notifications}
 
 
-def store_structured(page, results_bucket, key, raw_text):
-    structured = extract_structured(page, raw_text) if raw_text and len(raw_text.strip()) >= 30 else EMPTY_RESULT
-    results_bucket[key] = json.dumps(structured, ensure_ascii=False)
-
-
-def visit_and_extract(page, url, popup_key_prefix, results_bucket):
-    """Navigates to url, captures+closes popups, captures ticker/banner-image
-    text, extracts main content, runs it through free structured extraction,
-    and stores the result into results_bucket.
-    If the page turns out to be a bot-check / challenge page rather than
-    real content, stores a sentinel instead so it's never reported as a
-    'change' and never overwrites the last good snapshot."""
+def visit_page_once(page, url):
+    """Navigates to url and returns (content_json_or_sentinel, popup_json_or_None).
+    Callers should cache this per-URL so the same page is never scraped
+    twice in one run."""
     try:
         page.goto(url, timeout=45000, wait_until="domcontentloaded")
         settle(page)
 
         popup_text = capture_and_close_popups(page)
+        popup_json = None
         if popup_text and not is_blocked_page(popup_text):
-            store_structured(page, results_bucket, f"{url} [popup]", clean_lines(popup_text))
+            structured_popup = extract_structured(page, clean_lines(popup_text))
+            popup_json = json.dumps(structured_popup, ensure_ascii=False)
 
         ticker_and_alts = f"{extract_ticker_text(page)}\n{extract_image_alts(page)}".strip()
         main_text = extract_text(page)
         combined = f"{ticker_and_alts}\n\n{main_text}".strip() if ticker_and_alts else main_text
 
         if is_blocked_page(combined):
-            results_bucket[url] = SCRAPE_BLOCKED_SENTINEL
-        else:
-            store_structured(page, results_bucket, url, combined)
+            return SCRAPE_BLOCKED_SENTINEL, popup_json
+
+        if not combined or len(combined.strip()) < 30:
+            return json.dumps(EMPTY_RESULT, ensure_ascii=False), popup_json
+
+        structured = extract_structured(page, combined)
+        return json.dumps(structured, ensure_ascii=False), popup_json
     except Exception as e:
-        results_bucket[url] = f"[ERROR fetching page: {e}]"
+        return f"[ERROR fetching page: {e}]", None
 
 
 def scrape_university(browser, uni):
     """Returns dict: {"programs": {...}, "fees": {...}, "notifications": {...}}"""
     result = {"programs": {}, "fees": {}, "notifications": {}}
+    page_cache = {}  # url -> (content, popup_json) -- ensures each URL is only ever scraped once
     context = None
+
+    def get_or_visit(page, url):
+        if url not in page_cache:
+            page_cache[url] = visit_page_once(page, url)
+        return page_cache[url]
+
     try:
         context = browser.new_context(user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -331,41 +332,46 @@ def scrape_university(browser, uni):
         page.goto(uni["url"], timeout=45000, wait_until="domcontentloaded")
         settle(page)
 
-        # Homepage: always captured as a notifications entry too (running
-        # tickers / banner images / popups / "what's new" sections most
-        # often live here).
-        popup_text = capture_and_close_popups(page)
-        if popup_text and not is_blocked_page(popup_text):
-            store_structured(page, result["notifications"], f"{uni['url']} [popup]", clean_lines(popup_text))
-        ticker_and_alts = f"{extract_ticker_text(page)}\n{extract_image_alts(page)}".strip()
-        homepage_main = extract_text(page)
-        homepage_combined = f"{ticker_and_alts}\n\n{homepage_main}".strip() if ticker_and_alts else homepage_main
-        if is_blocked_page(homepage_combined):
-            result["notifications"][uni["url"]] = SCRAPE_BLOCKED_SENTINEL
-        else:
-            store_structured(page, result["notifications"], uni["url"], homepage_combined)
+        homepage_content, homepage_popup = get_or_visit(page, uni["url"])
+        result["notifications"][uni["url"]] = homepage_content
+        if homepage_popup:
+            result["notifications"][f"{uni['url']} [popup]"] = homepage_popup
 
-        program_urls = uni.get("program_urls") or discover_links(page, uni["url"], PROGRAM_KEYWORDS)
-        fee_urls = uni.get("fee_urls") or discover_links(page, uni["url"], FEE_KEYWORDS)
-        notification_urls = uni.get("notification_urls") or discover_links(page, uni["url"], NOTIFICATION_KEYWORDS)
+        program_urls = uni.get("program_urls") or discover_links(
+            page, uni["url"], PROGRAM_KEYWORDS, MAX_PROGRAM_PAGES)
+        fee_urls = uni.get("fee_urls") or discover_links(
+            page, uni["url"], FEE_KEYWORDS, MAX_FEE_PAGES)
+        notification_urls = uni.get("notification_urls") or discover_links(
+            page, uni["url"], NOTIFICATION_KEYWORDS, MAX_NOTIFICATION_PAGES)
 
         if not program_urls:
             program_urls = [uni["url"]]
-        if not fee_urls:
-            fee_urls = [uni["url"]]
+
+        # Fee data on these sites very often lives on each program's own
+        # page (a "Fee Structure" table), not a separate sitewide Fees
+        # page -- so program pages are always checked for fees too. The
+        # shared cache means this doesn't cost a second page visit.
+        fee_candidate_urls = list(dict.fromkeys(fee_urls + program_urls))[:MAX_PROGRAM_PAGES + MAX_FEE_PAGES]
+        if not fee_candidate_urls:
+            fee_candidate_urls = [uni["url"]]
 
         for url in program_urls:
-            visit_and_extract(page, url, "programs", result["programs"])
+            content, popup = get_or_visit(page, url)
+            result["programs"][url] = content
+            if popup:
+                result["programs"][f"{url} [popup]"] = popup
 
-        for url in fee_urls:
-            if url in result["fees"]:
-                continue
-            visit_and_extract(page, url, "fees", result["fees"])
+        for url in fee_candidate_urls:
+            content, popup = get_or_visit(page, url)
+            result["fees"][url] = content
+            if popup:
+                result["fees"][f"{url} [popup]"] = popup
 
         for url in notification_urls:
-            if url in result["notifications"]:
-                continue
-            visit_and_extract(page, url, "notifications", result["notifications"])
+            content, popup = get_or_visit(page, url)
+            result["notifications"][url] = content
+            if popup:
+                result["notifications"][f"{url} [popup]"] = popup
 
     except Exception as e:
         result["programs"]["_error"] = f"[Could not load site: {e}]"
